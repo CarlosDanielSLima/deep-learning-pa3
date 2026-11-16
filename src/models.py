@@ -1,6 +1,7 @@
 from sklearn.metrics import f1_score, accuracy_score
 import numpy as np
 
+import copy
 import torch
 import torch.nn as nn
 from torchvision import models, transforms
@@ -317,8 +318,13 @@ def train_linear_probe(
     probe_model.to(device)
     
     # Otimizador atualiza APENAS os pesos da camada linear
-    optimizer = torch.optim.Adam(probe_model.fc.parameters(), lr=lr)
+    optimizer = torch.optim.AdamW(probe_model.fc.parameters(), lr=lr, weight_decay=1e-2)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-5)
     criterion = nn.CrossEntropyLoss()
+    
+    best_val_f1 = -1.0
+    best_val_acc = 0.0
+    best_weights = copy.deepcopy(probe_model.state_dict())
     
     for epoch in range(epochs):
         # === TREINO ===
@@ -332,6 +338,7 @@ def train_linear_probe(
             loss = criterion(outputs, labels)
             loss.backward()
             optimizer.step()
+        scheduler.step()
             
     # === AVALIAÇÃO NO TEST_PUBLIC (Fim do Treino) ===
     probe_model.eval()
@@ -348,10 +355,17 @@ def train_linear_probe(
             all_labels.extend(labels.cpu().numpy())
             
     # Cálculo das métricas
-    f1 = f1_score(all_labels, all_preds, average='macro')
+    f1 = f1_score(all_labels, all_preds, average='macro', zero_division=0)
     acc = accuracy_score(all_labels, all_preds)
     
-    return f1, acc
+    if f1 > best_val_f1:
+            best_val_f1 = f1
+            best_val_acc = acc
+            best_weights = copy.deepcopy(probe_model.state_dict())
+            
+    # Restaura os pesos da melhor época de validação!
+    probe_model.load_state_dict(best_weights)
+    return best_val_f1, best_val_acc
 
 
 class FineTunedModel(nn.Module):
@@ -394,10 +408,13 @@ def train_fine_tuning(
         {'params': model.backbone.parameters(), 'lr': 1e-5},
         {'params': model.fc.parameters(), 'lr': 1e-3}
     ], weight_decay=1e-4)
-    
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
     criterion = nn.CrossEntropyLoss()
     
-    melhor_f1 = 0.0
+    melhor_f1 = -1.0
+    melhor_acc = 0.0
+    melhor_epoca = -1
+    best_weights = copy.deepcopy(model.state_dict())
     
     for epoch in range(epochs):
         # === TREINO ===
@@ -414,6 +431,7 @@ def train_fine_tuning(
             optimizer.step()
             
             epoch_loss += loss.item()
+        scheduler.step()
             
         # === AVALIAÇÃO ===
         model.eval()
@@ -430,21 +448,26 @@ def train_fine_tuning(
                 all_labels.extend(labels.cpu().numpy())
                 
         # Calcula as métricas no fim de cada época
-        f1 = f1_score(all_labels, all_preds, average='macro')
+        f1 = f1_score(all_labels, all_preds, average='macro', zero_division=0)
         acc = accuracy_score(all_labels, all_preds)
         loss_media = epoch_loss / len(train_loader_105)
         
         if f1 > melhor_f1:
             melhor_f1 = f1
+            melhor_acc = acc
+            melhor_epoca = epoch + 1
+            best_weights = copy.deepcopy(model.state_dict())
+            print(f"Nova melhor F1 Macro: {melhor_f1:.4f} na época {melhor_epoca} | Val Acc: {melhor_acc:.4f}")
             
         # Imprime o progresso a cada 10 épocas ou na última
         if (epoch + 1) % 10 == 0 or epoch == epochs - 1:
             print(f"Época {epoch+1}/{epochs} | Loss Treino: {loss_media:.4f} | Val F1: {f1:.4f} | Val Acc: {acc:.4f}")
-            
+        
     print(f"--- Fim do Fine-Tuning. Melhor F1 Macro: {melhor_f1:.4f} ---")
-    
+
+    model.load_state_dict(best_weights)
     # Retorna o modelo treinado, o último F1 e a última Accuracy
-    return model, f1, acc
+    return model, melhor_f1, melhor_acc
 
 
 
