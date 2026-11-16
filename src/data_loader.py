@@ -190,3 +190,50 @@ def get_supervised_dataloaders(
     )
 
     return train_loader, val_loader, test_loader
+
+
+
+def get_unsupervised_dataloaders(
+    root_dir: str,
+    batch_size: int = 16,
+    img_size: tuple = (256, 352),
+    num_workers: int = 2,
+    seed: int = 42,
+    transform=None
+):
+    """
+    Cria e retorna os DataLoaders não-supervisionados de treino, validação e teste público.
+    Garante shuffle=True apenas no treino e shuffle=False em val e test_public.
+    """
+    set_seed(seed)
+    train_tf, eval_tf = get_transforms(img_size=img_size)
+    if transform is not None:
+        train_tf = transform
+
+    train_ds = ENA24UnsupervisedDataset(
+        root_dir=root_dir, split='train', transform=train_tf
+    )
+    val_ds = ENA24UnsupervisedDataset(
+        root_dir=root_dir, split='val', transform=eval_tf
+    )
+    test_ds = ENA24UnsupervisedDataset(
+        root_dir=root_dir, split='test_public', transform=eval_tf
+    )
+
+    g = torch.Generator()
+    g.manual_seed(seed)
+
+    # Em Windows com Jupyter, se num_workers > 0 travar, basta passar num_workers=0
+    pin = torch.cuda.is_available()
+
+    train_loader = DataLoader(
+        train_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=pin, generator=g
+    )
+    val_loader = DataLoader(
+        val_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=pin
+    )
+    test_loader = DataLoader(
+        test_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=pin
+    )
+
+    return train_loader, val_loader, test_loader
