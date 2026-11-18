@@ -478,41 +478,77 @@ class SimpleGradCAM:
         self.gradients = None
         self.activations = None
         
-        # Hooks para capturar a ativação e o gradiente da camada alvo
-        target_layer.register_forward_hook(self.save_activation)
-        target_layer.register_full_backward_hook(self.save_gradient)
+        self.target_layer.register_forward_hook(self.save_activation_and_hook_gradient)
 
-    def save_activation(self, module, input, output):
+    def save_activation_and_hook_gradient(self, module, input, output):
         self.activations = output
+        
+        # CHECAGEM DE SEGURANÇA: Só tenta registrar o backward hook 
+        # se o tensor estiver exigindo gradiente (ignora no with torch.no_grad)
+        if output.requires_grad:
+            output.register_hook(self.save_gradient)
 
-    def save_gradient(self, module, grad_input, grad_output):
-        self.gradients = grad_output[0]
+    def save_gradient(self, grad):
+        self.gradients = grad
 
     def generate_cam(self, input_tensor, target_class):
         self.model.eval()
         self.model.zero_grad()
         
-        # Forward
         output = self.model(input_tensor)
         
-        # Cria um tensor one-hot para a classe alvo e faz o backward
         target = torch.zeros_like(output)
         target[0][target_class] = 1
         output.backward(gradient=target, retain_graph=True)
         
-        # Calcula os pesos do Grad-CAM (média espacial dos gradientes)
         weights = torch.mean(self.gradients, dim=[2, 3], keepdim=True)
-        
-        # Multiplica as ativações pelos pesos
         cam = torch.sum(weights * self.activations, dim=1, keepdim=True)
-        cam = torch.relu(cam) # Apenas influências positivas
+        cam = torch.relu(cam) 
         
-        # Normaliza o CAM para [0, 1]
         cam = cam - torch.min(cam)
         cam = cam / (torch.max(cam) + 1e-8)
         
         return cam.squeeze().cpu().detach().numpy()
 
+
+# 1. Criamos um Wrapper que ignora o forward original do LinearProbe
+class GradCAMLinearProbeWrapper(nn.Module):
+    def __init__(self, trained_probe):
+        super().__init__()
+        # Aproveita as mesmas instâncias (e pesos) já treinados
+        self.backbone = trained_probe.backbone
+        self.fc = trained_probe.fc
+        
+        # Garante que o backbone aceitará gradientes para o Grad-CAM
+        for param in self.backbone.parameters():
+            param.requires_grad = True
+
+    def forward(self, x):
+        # ATENÇÃO: Aqui fazemos o forward SEM o "with torch.no_grad()"
+        features = self.backbone(x)
+        features = torch.flatten(features, 1)
+        logits = self.fc(features)
+        return logits
+    
+
+def load_best_model(checkpoint_path: str, device: torch.device) -> nn.Module:
+    """
+    Carrega o backbone de um modelo (ResNet-18) e os pesos de um checkpoint.
+
+    Args:
+        checkpoint_path (str): Caminho para o checkpoint a ser carregado. Se None, não carrega pesos adicionais.
+    """
+    backbone = build_resnet18(pretrained=True)
+
+    backbone = nn.Sequential(*list(backbone.children())[:-1])  # Remove a camada final (fc)
+    final_model = LinearProbe(backbone=backbone, num_classes=21)
+
+    state_dict = torch.load(checkpoint_path, map_location=torch.device('cpu'))
+    final_model.load_state_dict(state_dict)
+
+    final_model = GradCAMLinearProbeWrapper(final_model).to(device)
+
+    return final_model.to(device)
 
 
 def build_model(model_type: str = "resnet18", num_classes: int = 21, pretrained: bool = True) -> nn.Module:
