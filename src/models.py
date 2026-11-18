@@ -1,5 +1,6 @@
 from sklearn.metrics import f1_score, accuracy_score
 import numpy as np
+import copy
 
 import copy
 import torch
@@ -470,6 +471,47 @@ def train_fine_tuning(
     return model, melhor_f1, melhor_acc
 
 
+class SimpleGradCAM:
+    def __init__(self, model, target_layer):
+        self.model = model
+        self.target_layer = target_layer
+        self.gradients = None
+        self.activations = None
+        
+        # Hooks para capturar a ativação e o gradiente da camada alvo
+        target_layer.register_forward_hook(self.save_activation)
+        target_layer.register_full_backward_hook(self.save_gradient)
+
+    def save_activation(self, module, input, output):
+        self.activations = output
+
+    def save_gradient(self, module, grad_input, grad_output):
+        self.gradients = grad_output[0]
+
+    def generate_cam(self, input_tensor, target_class):
+        self.model.eval()
+        self.model.zero_grad()
+        
+        # Forward
+        output = self.model(input_tensor)
+        
+        # Cria um tensor one-hot para a classe alvo e faz o backward
+        target = torch.zeros_like(output)
+        target[0][target_class] = 1
+        output.backward(gradient=target, retain_graph=True)
+        
+        # Calcula os pesos do Grad-CAM (média espacial dos gradientes)
+        weights = torch.mean(self.gradients, dim=[2, 3], keepdim=True)
+        
+        # Multiplica as ativações pelos pesos
+        cam = torch.sum(weights * self.activations, dim=1, keepdim=True)
+        cam = torch.relu(cam) # Apenas influências positivas
+        
+        # Normaliza o CAM para [0, 1]
+        cam = cam - torch.min(cam)
+        cam = cam / (torch.max(cam) + 1e-8)
+        
+        return cam.squeeze().cpu().detach().numpy()
 
 
 
